@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["from_scalar_fn_to_df_fn_impl","typename_to_cdt"]};
