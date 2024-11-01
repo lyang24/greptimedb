@@ -24,11 +24,14 @@ mod show;
 mod tql;
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use catalog::kvbackend::KvBackendCatalogManager;
 use catalog::CatalogManagerRef;
-use client::RecordBatches;
+use client::{OutputData, RecordBatches, SendableRecordBatchStream};
 use common_error::ext::BoxedError;
 use common_meta::cache::TableRouteCacheRef;
 use common_meta::cache_invalidator::CacheInvalidatorRef;
@@ -39,10 +42,15 @@ use common_meta::key::view_info::{ViewInfoManager, ViewInfoManagerRef};
 use common_meta::key::{TableMetadataManager, TableMetadataManagerRef};
 use common_meta::kv_backend::KvBackendRef;
 use common_query::Output;
+use common_recordbatch::adapter::RecordBatchMetrics;
+use common_recordbatch::error::StreamTimeoutSnafu;
+use common_recordbatch::{OrderOption, RecordBatch, RecordBatchStream};
 use common_telemetry::tracing;
 use common_time::range::TimestampRange;
 use common_time::Timestamp;
 use datafusion_expr::LogicalPlan;
+use datatypes::schema::SchemaRef;
+use futures::stream::Stream;
 use partition::manager::{PartitionRuleManager, PartitionRuleManagerRef};
 use query::parser::QueryStatement;
 use query::stats::StatementStatistics;
@@ -65,8 +73,8 @@ use table::TableRef;
 use self::set::{set_bytea_output, set_datestyle, set_timezone, validate_client_encoding};
 use crate::error::{
     self, CatalogSnafu, ExecLogicalPlanSnafu, ExternalSnafu, InvalidSqlSnafu, NotSupportedSnafu,
-    PlanStatementSnafu, Result, SchemaNotFoundSnafu, TableMetadataManagerSnafu, TableNotFoundSnafu,
-    UpgradeCatalogManagerRefSnafu,
+    PlanStatementSnafu, Result, SchemaNotFoundSnafu, StatementTimeoutSnafu,
+    TableMetadataManagerSnafu, TableNotFoundSnafu, UpgradeCatalogManagerRefSnafu,
 };
 use crate::insert::InserterRef;
 use crate::statement::copy_database::{COPY_DATABASE_TIME_END_KEY, COPY_DATABASE_TIME_START_KEY};
@@ -416,8 +424,8 @@ impl StatementExecutor {
 
     #[tracing::instrument(skip_all)]
     async fn plan_exec(&self, stmt: QueryStatement, query_ctx: QueryContextRef) -> Result<Output> {
-        let plan = self.plan(&stmt, query_ctx.clone()).await?;
-        self.exec_plan(plan, query_ctx).await
+        let timeout = derive_timeout(&stmt, &query_ctx);
+        self.plan_exec_inner(stmt, query_ctx, timeout).await
     }
 
     async fn get_table(&self, table_ref: &TableReference<'_>) -> Result<TableRef> {
@@ -434,6 +442,114 @@ impl StatementExecutor {
                 table_name: table_ref.to_string(),
             })
     }
+
+    async fn plan_exec_inner(
+        &self,
+        stmt: QueryStatement,
+        query_ctx: QueryContextRef,
+        timeout: Option<Duration>,
+    ) -> Result<Output> {
+        let exec_query = |stmt: QueryStatement, ctx: QueryContextRef| async move {
+            let plan = self.plan(&stmt, ctx.clone()).await?;
+            self.query_engine
+                .execute(plan, ctx)
+                .await
+                .context(ExecLogicalPlanSnafu)
+        };
+        if let Some(t) = timeout {
+            let start = tokio::time::Instant::now();
+            let timeout_future = tokio::time::sleep(t);
+            tokio::select! {
+                result = exec_query(stmt, query_ctx.clone()) => {
+                    let new_timeout = t - start.elapsed();
+                    return Ok(attach_timeout_stream(result?, new_timeout));
+                }
+                _ = timeout_future => {
+                    return StatementTimeoutSnafu.fail()
+                }
+            }
+        }
+        exec_query(stmt, query_ctx.clone()).await
+    }
+}
+
+fn attach_timeout_stream(output: Output, timeout: Duration) -> Output {
+    match output.data {
+        OutputData::AffectedRows(_) | OutputData::RecordBatches(_) => output,
+        OutputData::Stream(stream) => {
+            let stream = TimeoutStream::new(stream, timeout);
+            Output::new(OutputData::Stream(Box::pin(stream)), output.meta)
+        }
+    }
+}
+
+struct TimeoutStream {
+    stream: SendableRecordBatchStream,
+    timeout_duration: Duration,
+    last_poll: Option<tokio::time::Instant>,
+}
+
+impl TimeoutStream {
+    fn new(stream: SendableRecordBatchStream, timeout_duration: Duration) -> Self {
+        TimeoutStream {
+            stream,
+            timeout_duration,
+            last_poll: Some(tokio::time::Instant::now()),
+        }
+    }
+}
+
+impl RecordBatchStream for TimeoutStream {
+    fn name(&self) -> &str {
+        self.stream.name()
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.stream.schema()
+    }
+
+    fn output_ordering(&self) -> Option<&[OrderOption]> {
+        self.stream.output_ordering()
+    }
+
+    fn metrics(&self) -> Option<RecordBatchMetrics> {
+        self.stream.metrics()
+    }
+}
+
+impl Stream for TimeoutStream {
+    type Item = common_recordbatch::error::Result<RecordBatch>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if let Some(last_poll) = this.last_poll {
+            if last_poll.elapsed() >= this.timeout_duration {
+                return Poll::Ready(Some(StreamTimeoutSnafu.fail()));
+            }
+        }
+
+        let result = Pin::new(&mut this.stream).poll_next(cx);
+
+        let res = result;
+        this.last_poll = Some(tokio::time::Instant::now());
+        res
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
+
+fn derive_timeout(stmt: &QueryStatement, query_ctx: &QueryContextRef) -> Option<Duration> {
+    if let Some(query_timeout) = query_ctx.query_timeout() {
+        return match (query_ctx.channel(), stmt) {
+            (Channel::Mysql, QueryStatement::Sql(Statement::Query(_)))
+            | (Channel::Postgres, QueryStatement::Sql(_)) => Some(query_timeout),
+            (_, _) => None,
+        };
+    }
+    None
 }
 
 fn to_copy_table_request(stmt: CopyTable, query_ctx: QueryContextRef) -> Result<CopyTableRequest> {

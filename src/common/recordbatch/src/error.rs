@@ -161,6 +161,11 @@ pub enum Error {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Stream timeout"))]
+    StreamTimeout {
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 impl ErrorExt for Error {
@@ -190,6 +195,8 @@ impl ErrorExt for Error {
             Error::SchemaConversion { source, .. } | Error::CastVector { source, .. } => {
                 source.status_code()
             }
+
+            Error::StreamTimeout { .. } => StatusCode::Cancelled,
         }
     }
 
