@@ -30,6 +30,7 @@ use common_query::native_histogram::{
 use common_query::prometheus::{format_prometheus_float, is_prometheus_stale_nan};
 use common_query::{Output, OutputData};
 use common_recordbatch::RecordBatches;
+use datatypes::arrow_array::string_array_value_at_index;
 use datatypes::prelude::ConcreteDataType;
 use indexmap::IndexMap;
 use promql_parser::label::METRIC_NAME;
@@ -281,7 +282,7 @@ impl PrometheusJsonResponse {
             // prepare things...
             let tag_columns = tag_column_indices
                 .iter()
-                .map(|i| batch.column(*i).as_string::<i32>())
+                .map(|i| batch.column(*i))
                 .collect::<Vec<_>>();
             let tag_names = tag_column_indices
                 .iter()
@@ -344,9 +345,8 @@ impl PrometheusJsonResponse {
                     tags.push((METRIC_NAME, metric_name.as_str()));
                 }
                 for (tag_column, tag_name) in tag_columns.iter().zip(tag_names.iter()) {
-                    // TODO(ruihang): add test for NULL tag
-                    if tag_column.is_valid(row_index) {
-                        tags.push((tag_name, tag_column.value(row_index)));
+                    if let Some(tag_value) = string_array_value_at_index(tag_column, row_index) {
+                        tags.push((tag_name, tag_value));
                     }
                 }
 
@@ -445,6 +445,7 @@ mod tests {
     };
     use common_query::prometheus::PROMETHEUS_STALE_NAN_BITS;
     use common_recordbatch::{RecordBatch, RecordBatches};
+    use datatypes::arrow::array::StringViewArray;
     use datatypes::data_type::ConcreteDataType;
     use datatypes::schema::{ColumnSchema, Schema};
     use datatypes::vectors::{
@@ -527,6 +528,52 @@ mod tests {
         assert_eq!(
             series[0].values,
             vec![(1.0, "1".to_string()), (2.0, "NaN".to_string())]
+        );
+    }
+
+    #[test]
+    fn record_batches_to_data_supports_utf8_view_tags() {
+        let schema = Arc::new(Schema::new(vec![
+            ColumnSchema::new(
+                "timestamp",
+                ConcreteDataType::timestamp_millisecond_datatype(),
+                false,
+            ),
+            ColumnSchema::new(
+                "host",
+                ConcreteDataType::from_arrow_type(&DataType::Utf8View),
+                false,
+            ),
+            ColumnSchema::new("value", ConcreteDataType::float64_datatype(), false),
+        ]));
+        let batch = RecordBatch::new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondVector::from_vec(vec![1_000, 2_000])) as _,
+                Arc::new(StringVector::from(StringViewArray::from(vec![
+                    "host-a", "host-a",
+                ]))) as _,
+                Arc::new(Float64Vector::from_vec(vec![1.0, 2.0])) as _,
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatches::try_new(schema, vec![batch]).unwrap();
+
+        let response =
+            PrometheusJsonResponse::record_batches_to_data(batches, None, ValueType::Matrix)
+                .unwrap();
+        let PrometheusResponse::PromData(data) = response else {
+            panic!("expected Prometheus data response");
+        };
+        let PromQueryResult::Matrix(series) = data.result else {
+            panic!("expected matrix result");
+        };
+
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].metric["host"], "host-a");
+        assert_eq!(
+            series[0].values,
+            vec![(1.0, "1".to_string()), (2.0, "2".to_string())]
         );
     }
 
